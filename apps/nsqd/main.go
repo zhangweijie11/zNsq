@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/BurntSushi/toml"
@@ -137,4 +138,24 @@ func (p *program) Stop() error {
 		p.nsqd.Exit()
 	})
 	return nil
+}
+
+// Handle 用于处理操作系统的信号
+// 该方法主要目的是为了优雅地停止或处理对外服务
+// 当接收到指定的信号时，该方法将返回一个错误，指示需要停止服务
+// 参数:
+//
+//	s os.Signal: 操作系统发送的信号
+//
+// 返回值:
+//
+//	error: 如果信号处理导致服务需要停止，则返回svc.ErrStop错误
+func (p *program) Handle(s os.Signal) error {
+	return svc.ErrStop
+}
+
+// Context 返回nsqd的上下文对象
+// 通过此方法可以获取program实例所在nsqd实例的上下文信息
+func (p *program) Context() context.Context {
+	return p.nsqd.Context()
 }

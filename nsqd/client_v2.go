@@ -976,3 +976,24 @@ func (s ClientV2Stats) String() string {
 		duration,
 	)
 }
+
+// Empty 清空客户端状态。
+// 该方法主要用于客户端异常或需要重置状态的场景。
+// 它通过将飞行中的请求计数器 InFlightCount 设置为 0 来实现。
+// 同时，它调用 tryUpdateReadyState 方法来尝试更新客户端的就绪状态。
+func (c *clientV2) Empty() {
+	// 使用原子操作将 InFlightCount 设置为 0，确保线程安全。
+	atomic.StoreInt64(&c.InFlightCount, 0)
+	// 调用 tryUpdateReadyState 方法尝试更新客户端的就绪状态。
+	c.tryUpdateReadyState()
+}
+
+// Auth 使用给定的密钥对客户端进行认证。
+//
+// secret 是服务器用于认证的密钥。
+//
+// 返回错误如果认证失败。
+func (c *clientV2) Auth(secret string) error {
+	c.AuthSecret = secret // 将认证密钥设置给客户端。
+	return c.QueryAuthd() // 调用QueryAuthd方法进行认证查询。
+}

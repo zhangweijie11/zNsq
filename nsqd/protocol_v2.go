@@ -1262,3 +1262,86 @@ func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBo
 	// 返回所有读取到的消息
 	return messages, nil
 }
+
+// AUTH AUTH是协议V2中处理客户端认证请求的方法。
+// 它接收来自客户端的认证信息并进行验证，然后根据验证结果返回相应的响应。
+func (p *protocolV2) AUTH(client *clientV2, params [][]byte) ([]byte, error) {
+	// 检查客户端状态是否允许进行认证。
+	if atomic.LoadInt32(&client.State) != stateInit {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot AUTH in current state")
+	}
+
+	// 确保认证参数的数量正确。
+	if len(params) != 1 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "AUTH invalid number of parameters")
+	}
+
+	// 读取认证请求的消息体长度。
+	bodyLen, err := readLen(client.Reader, client.lenSlice)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY", "AUTH failed to read body size")
+	}
+
+	// 检查消息体长度是否超过最大允许大小。
+	if int64(bodyLen) > p.nsqd.getOpts().MaxBodySize {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+			fmt.Sprintf("AUTH body too big %d > %d", bodyLen, p.nsqd.getOpts().MaxBodySize))
+	}
+
+	// 确认消息体长度为正数。
+	if bodyLen <= 0 {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+			fmt.Sprintf("AUTH invalid body size %d", bodyLen))
+	}
+
+	// 读取认证请求的消息体内容。
+	body := make([]byte, bodyLen)
+	_, err = io.ReadFull(client.Reader, body)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY", "AUTH failed to read body")
+	}
+
+	// 检查客户端是否已经设置了认证信息。
+	if client.HasAuthorizations() {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "AUTH already set")
+	}
+
+	// 确认服务器启用了认证。
+	if !client.nsqd.IsAuthEnabled() {
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_DISABLED", "AUTH disabled")
+	}
+
+	// 尝试对客户端进行认证。
+	if err := client.Auth(string(body)); err != nil {
+		p.nsqd.logf(LOG_WARN, "PROTOCOL(V2): [%s] AUTH failed %s", client, err)
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_FAILED", "AUTH failed")
+	}
+
+	// 确保客户端通过了认证。
+	if !client.HasAuthorizations() {
+		return nil, protocol.NewFatalClientErr(nil, "E_UNAUTHORIZED", "AUTH no authorizations found")
+	}
+
+	// 构建认证成功的响应数据。
+	resp, err := json.Marshal(struct {
+		Identity        string `json:"identity"`
+		IdentityURL     string `json:"identity_url"`
+		PermissionCount int    `json:"permission_count"`
+	}{
+		Identity:        client.AuthState.Identity,
+		IdentityURL:     client.AuthState.IdentityURL,
+		PermissionCount: len(client.AuthState.Authorizations),
+	})
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_ERROR", "AUTH error "+err.Error())
+	}
+
+	// 发送认证成功响应给客户端。
+	err = p.Send(client, frameTypeResponse, resp)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_ERROR", "AUTH error "+err.Error())
+	}
+
+	// 认证处理完成，无错误返回。
+	return nil, nil
+}

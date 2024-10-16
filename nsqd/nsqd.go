@@ -3,6 +3,7 @@ package nsqd
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"github.com/zhangweijie11/zNsq/internal/dirlock"
 	"github.com/zhangweijie11/zNsq/internal/http_api"
 	"github.com/zhangweijie11/zNsq/internal/protocol"
+	"github.com/zhangweijie11/zNsq/internal/statsd"
 	"github.com/zhangweijie11/zNsq/internal/util"
 	"github.com/zhangweijie11/zNsq/internal/version"
 	"log"
@@ -64,18 +66,24 @@ func (n *NSQD) getOpts() *Options {
 	return n.opts.Load().(*Options)
 }
 
+// New 创建一个新的NSQD实例。
+// 参数opts是用于配置NSQD的选项。
+// 返回一个指向NSQD实例的指针和一个错误（如果有）。
 func New(opts *Options) (*NSQD, error) {
 	var err error
 
+	// 确定数据路径，默认为当前工作目录。
 	dataPath := opts.DataPath
 	if opts.DataPath == "" {
 		cwd, _ := os.Getwd()
 		dataPath = cwd
 	}
+	// 初始化日志记录器，如果未提供的话。
 	if opts.Logger == nil {
 		opts.Logger = log.New(os.Stderr, opts.LogPrefix, log.Ldate|log.Ltime|log.Lmicroseconds)
 	}
 
+	// 初始化NSQD实例。
 	n := &NSQD{
 		startTime:            time.Now(),
 		topicMap:             make(map[string]*Topic),
@@ -85,7 +93,110 @@ func New(opts *Options) (*NSQD, error) {
 		dl:                   dirlock.New(dataPath),
 	}
 	n.ctx, n.ctxCancel = context.WithCancel(context.Background())
-	return nil, err
+	httpcli := http_api.NewClient(nil, opts.HTTPClientConnectTimeout, opts.HTTPClientRequestTimeout)
+	n.ci = clusterinfo.New(n.logf, httpcli)
+
+	// 初始化lookupPeers存储。
+	n.lookupPeers.Store([]*lookupPeer{})
+
+	// 应用传入的配置选项。
+	n.swapOpts(opts)
+	// 初始化错误存储。
+	n.errValue.Store(errStore{})
+
+	// 尝试锁定数据路径。
+	err = n.dl.Lock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock data-path: %v", err)
+	}
+
+	// 验证配置参数的有效性。
+	if opts.MaxDeflateLevel < 1 || opts.MaxDeflateLevel > 9 {
+		return nil, errors.New("--max-deflate-level must be [1,9]")
+	}
+	if opts.ID < 0 || opts.ID >= 1024 {
+		return nil, errors.New("--node-id must be [0,1024)")
+	}
+
+	// 处理TLS配置。
+	tlsConfig, err := buildTLSConfig(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build TLS config - %s", err)
+	}
+	if tlsConfig == nil && opts.TLSRequired != TLSNotRequired {
+		return nil, errors.New("cannot require TLS client connections without TLS key and cert")
+	}
+	n.tlsConfig = tlsConfig
+
+	// 处理客户端TLS配置。
+	clientTLSConfig, err := buildClientTLSConfig(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build client TLS config - %s", err)
+	}
+	n.clientTLSConfig = clientTLSConfig
+
+	// 验证认证HTTP请求方法。
+	if opts.AuthHTTPRequestMethod != "post" && opts.AuthHTTPRequestMethod != "get" {
+		return nil, errors.New("--auth-http-request-method must be post or get")
+	}
+
+	// 验证端到端处理延迟百分位数。
+	for _, v := range opts.E2EProcessingLatencyPercentiles {
+		if v <= 0 || v > 1 {
+			return nil, fmt.Errorf("invalid E2E processing latency percentile: %v", v)
+		}
+	}
+
+	// 日志记录NSQD启动信息。
+	n.logf(LOG_INFO, version.String("nsqd"))
+	n.logf(LOG_INFO, "ID: %d", opts.ID)
+
+	// 初始化TCP服务器。
+	n.tcpServer = &tcpServer{nsqd: n}
+	n.tcpListener, err = net.Listen(util.TypeOfAddr(opts.TCPAddress), opts.TCPAddress)
+	if err != nil {
+		return nil, fmt.Errorf("listen (%s) failed - %s", opts.TCPAddress, err)
+	}
+	// 初始化HTTP服务器（如果配置了地址）。
+	if opts.HTTPAddress != "" {
+		n.httpListener, err = net.Listen(util.TypeOfAddr(opts.HTTPAddress), opts.HTTPAddress)
+		if err != nil {
+			return nil, fmt.Errorf("listen (%s) failed - %s", opts.HTTPAddress, err)
+		}
+	}
+	// 初始化HTTPS服务器（如果配置了TLS配置和地址）。
+	if n.tlsConfig != nil && opts.HTTPSAddress != "" {
+		n.httpsListener, err = tls.Listen("tcp", opts.HTTPSAddress, n.tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("listen (%s) failed - %s", opts.HTTPSAddress, err)
+		}
+	}
+	// 设置广播端口。
+	if opts.BroadcastHTTPPort == 0 {
+		tcpAddr, ok := n.RealHTTPAddr().(*net.TCPAddr)
+		if ok {
+			opts.BroadcastHTTPPort = tcpAddr.Port
+		}
+	}
+	if opts.BroadcastTCPPort == 0 {
+		tcpAddr, ok := n.RealTCPAddr().(*net.TCPAddr)
+		if ok {
+			opts.BroadcastTCPPort = tcpAddr.Port
+		}
+	}
+	// 配置Statsd前缀。
+	if opts.StatsdPrefix != "" {
+		var port string = fmt.Sprint(opts.BroadcastHTTPPort)
+		statsdHostKey := statsd.HostKey(net.JoinHostPort(opts.BroadcastAddress, port))
+		prefixWithHost := strings.Replace(opts.StatsdPrefix, "%s", statsdHostKey, -1)
+		if prefixWithHost[len(prefixWithHost)-1] != '.' {
+			prefixWithHost += "."
+		}
+		opts.StatsdPrefix = prefixWithHost
+	}
+
+	// 返回NSQD实例。
+	return n, nil
 }
 
 // 组装 nsqd 元数据文件路径
@@ -820,4 +931,105 @@ func (n *NSQD) Exit() {
 	n.logf(LOG_INFO, "NSQ: bye")
 	// 取消上下文
 	n.ctxCancel()
+}
+
+func (n *NSQD) Context() context.Context {
+	return n.ctx
+}
+
+// buildTLSConfig 构建TLS配置对象。
+// 该函数根据Options中的配置信息来设置TLS连接的相关参数。
+// 如果不需要TLS配置，则返回nil。
+// 参数:
+//
+//	opts - 配置选项，包含TLS证书、密钥、客户端认证策略等信息。
+//
+// 返回值:
+//
+//	*tls.Config - TLS配置对象，如果不需要TLS则为nil。
+//	error - 错误对象，如果出现错误则为非nil。
+func buildTLSConfig(opts *Options) (*tls.Config, error) {
+	// 如果TLS证书和密钥都未提供，则不启用TLS。
+	if opts.TLSCert == "" && opts.TLSKey == "" {
+		return nil, nil
+	}
+
+	// 默认TLS客户端认证策略为：如果提供了客户端证书，则验证客户端证书。
+	tlsClientAuthPolicy := tls.VerifyClientCertIfGiven
+
+	// 加载服务器的X.509证书和私钥。
+	cert, err := tls.LoadX509KeyPair(opts.TLSCert, opts.TLSKey)
+	if err != nil {
+		return nil, err
+	}
+	// 根据配置信息，设置TLS客户端认证策略。
+	switch opts.TLSClientAuthPolicy {
+	case "require":
+		tlsClientAuthPolicy = tls.RequireAnyClientCert
+	case "require-verify":
+		tlsClientAuthPolicy = tls.RequireAndVerifyClientCert
+	default:
+		tlsClientAuthPolicy = tls.NoClientCert
+	}
+
+	// 初始化TLS配置，并设置基本的配置信息。
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tlsClientAuthPolicy,
+		MinVersion:   opts.TLSMinVersion,
+	}
+
+	// 如果指定了根CA文件，则加载并设置到TLS配置中。
+	if opts.TLSRootCAFile != "" {
+		tlsCertPool := x509.NewCertPool()
+		caCertFile, err := os.ReadFile(opts.TLSRootCAFile)
+		if err != nil {
+			return nil, err
+		}
+		// 将根CA证书添加到证书池中。
+		if !tlsCertPool.AppendCertsFromPEM(caCertFile) {
+			return nil, errors.New("failed to append certificate to pool")
+		}
+		tlsConfig.ClientCAs = tlsCertPool
+	}
+
+	return tlsConfig, nil
+}
+
+// buildClientTLSConfig 构建客户端的TLS配置。
+// 该函数根据提供的Options配置TLS连接的最小版本，并可选地配置根证书。
+// 如果指定了TLSRootCAFile选项，则会从该文件中加载并添加根证书到证书池。
+// 参数:
+//
+//	opts (*Options): 配置选项的指针，用于设置TLS最小版本和根证书文件路径。
+//
+// 返回值:
+//
+//	(*tls.Config): 构建好的TLS配置的指针。
+//	(error): 如果在读取根证书文件时发生错误，或者未能将证书添加到证书池时返回错误。
+func buildClientTLSConfig(opts *Options) (*tls.Config, error) {
+	// 初始化TLS配置，设置最小TLS版本。
+	tlsConfig := &tls.Config{
+		MinVersion: opts.TLSMinVersion,
+	}
+
+	// 如果指定了根证书文件路径，则加载根证书并配置证书池。
+	if opts.TLSRootCAFile != "" {
+		// 创建一个新的证书池。
+		tlsCertPool := x509.NewCertPool()
+		// 读取根证书文件内容。
+		caCertFile, err := os.ReadFile(opts.TLSRootCAFile)
+		if err != nil {
+			return nil, err
+		}
+		// 将读取的证书添加到证书池中。
+		if !tlsCertPool.AppendCertsFromPEM(caCertFile) {
+			return nil, errors.New("failed to append certificate to pool")
+		}
+		// 将配置的证书池赋值给TLS配置。
+		tlsConfig.RootCAs = tlsCertPool
+	}
+
+	// 返回构建好的TLS配置。
+	return tlsConfig, nil
 }
